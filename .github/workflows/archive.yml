@@ -1,0 +1,355 @@
+name: Archive and Release MeloNX
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'Target Repository URL'
+        required: true
+        default: 'https://git.ryujinx.app/projects/MeloNX.git'
+      split_size_mb:
+        description: 'Max file chunk size in MB (GitHub Release limit is 2000 MB)'
+        required: true
+        default: '2000'
+  schedule:
+    # Runs weekly on Sunday at midnight UTC (adjust as needed)
+    - cron: '0 0 * * 0'
+
+permissions:
+  contents: write
+
+jobs:
+  archive-and-release:
+    name: Clone, Compress and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install System Prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            curl \
+            jq \
+            tar \
+            xz-utils \
+            git \
+            git-lfs \
+            coreutils
+
+      - name: Fetch and Install Latest Official 7-Zip Binary
+        run: |
+          echo "::group::Installing official 7-Zip release binary"
+          
+          # Attempt resolving latest Linux x64 binary URL from official GitHub releases
+          SEVENZIP_URL=$(curl -fsSL https://api.github.com/repos/ip7z/7zip/releases/latest 2>/dev/null \
+            | jq -r '.assets[] | select(.name | test("linux-x64.tar.xz$")) | .browser_download_url' | head -n1 || true)
+
+          # Fallback to direct scraping from official 7-zip.org download page if GitHub API is throttled
+          if [ -z "$SEVENZIP_URL" ] || [ "$SEVENZIP_URL" = "null" ]; then
+            DOWNLOAD_HTML=$(curl -fsSL https://www.7-zip.org/download.html 2>/dev/null || true)
+            TAR_REL_PATH=$(echo "$DOWNLOAD_HTML" | grep -Eo 'a/7z[0-9]+-linux-x64\.tar\.xz' | head -n1 || true)
+            if [ -n "$TAR_REL_PATH" ]; then
+              SEVENZIP_URL="https://www.7-zip.org/${TAR_REL_PATH}"
+            else
+              SEVENZIP_URL="https://www.7-zip.org/a/7z2409-linux-x64.tar.xz"
+            fi
+          fi
+
+          echo "Downloading 7-Zip from: $SEVENZIP_URL"
+          mkdir -p /tmp/7z-bin
+          curl -fsSL "$SEVENZIP_URL" | tar -xJ -C /tmp/7z-bin
+
+          sudo cp /tmp/7z-bin/7zz /usr/local/bin/7zz
+          sudo chmod +x /usr/local/bin/7zz
+          sudo ln -sf /usr/local/bin/7zz /usr/local/bin/7z
+
+          echo "Installed 7-Zip version:"
+          7zz | head -n 2
+          echo "::endgroup::"
+
+      - name: Clone Full Repository and External Symlinked Dependencies
+        id: clone
+        run: |
+          echo "::group::Cloning MeloNX repository with all branches, tags, and LFS objects"
+          REPO_URL="${{ github.event.inputs.repo_url || 'https://git.ryujinx.app/projects/MeloNX.git' }}"
+          WORK_DIR="${GITHUB_WORKSPACE:-$PWD}"
+          TARGET_DIR="${WORK_DIR}/MeloNX"
+
+          # 1. Full clone with all submodules
+          git clone --recurse-submodules --shallow-submodules=no "$REPO_URL" "$TARGET_DIR"
+          cd "$TARGET_DIR"
+
+          # 2. Fetch all branches, tags, and refs
+          git fetch --all --tags --prune
+
+          # 3. Create explicit local tracking branches for ALL remote branches
+          for remote_branch in $(git branch -r | grep -v -- '->'); do
+            branch_name="${remote_branch#origin/}"
+            git branch --track "$branch_name" "$remote_branch" 2>/dev/null || true
+          done
+
+          # 4. Fetch all remote branches and tags for submodules recursively
+          git submodule foreach --recursive '
+            git fetch --all --tags --prune || true
+            for rb in $(git branch -r 2>/dev/null | grep -v -- "->" || true); do
+              b="${rb#origin/}"
+              git branch --track "$b" "$rb" 2>/dev/null || true
+            done
+          ' || true
+
+          # 5. Fetch all Git LFS binary payloads across all historical commits and branches
+          if command -v git-lfs >/dev/null 2>&1; then
+            git lfs install || true
+            git lfs fetch --all || true
+            git lfs pull || true
+            git submodule foreach --recursive '
+              git lfs install 2>/dev/null || true
+              git lfs fetch --all 2>/dev/null || true
+              git lfs pull 2>/dev/null || true
+            ' || true
+          fi
+
+          # 6. Extract commit metadata for release versioning
+          COMMIT_DATE=$(git log -1 --format=%cd --date=format:'%Y.%m.%d')
+          COMMIT_HASH=$(git log -1 --format=%h)
+          COMMIT_FULL_HASH=$(git log -1 --format=%H)
+          COMMIT_SUBJECT=$(git log -1 --format=%s)
+          COMMIT_AUTHOR=$(git log -1 --format='%an <%ae>')
+
+          echo "tag_name=${COMMIT_DATE}" >> "$GITHUB_OUTPUT"
+          echo "commit_hash=${COMMIT_HASH}" >> "$GITHUB_OUTPUT"
+          echo "commit_full_hash=${COMMIT_FULL_HASH}" >> "$GITHUB_OUTPUT"
+          echo "commit_subject=${COMMIT_SUBJECT}" >> "$GITHUB_OUTPUT"
+          echo "commit_author=${COMMIT_AUTHOR}" >> "$GITHUB_OUTPUT"
+
+          echo "Latest commit date: $COMMIT_DATE ($COMMIT_HASH)"
+          echo "::endgroup::"
+
+          echo "::group::Resolving external symlinks and sibling dependencies"
+          # 7. Detect and resolve any symlinks pointing outside the repository tree
+          REPO_ROOT=$(realpath "$TARGET_DIR")
+          PARENT_DIR=$(dirname "$REPO_ROOT")
+
+          find "$REPO_ROOT" -type l | while read -r link; do
+            raw_target=$(readlink "$link")
+            link_dir=$(dirname "$link")
+            resolved_target=$(realpath -m "$link_dir/$raw_target")
+
+            # Check if symlink points outside the cloned repo
+            if [[ "$resolved_target" != "$REPO_ROOT"* ]]; then
+              echo "External symlink found: $link -> $raw_target"
+              dep_name=$(basename "$resolved_target")
+
+              # If target is missing, attempt to clone sibling repo from git.ryujinx.app
+              if [ ! -e "$resolved_target" ]; then
+                echo "Attempting to clone external dependency '$dep_name' into $PARENT_DIR/$dep_name..."
+                git clone --recurse-submodules "https://git.ryujinx.app/projects/${dep_name}.git" "$PARENT_DIR/$dep_name" 2>/dev/null || \
+                git clone --recurse-submodules "https://git.ryujinx.app/Ryubing/${dep_name}.git" "$PARENT_DIR/$dep_name" 2>/dev/null || \
+                true
+              fi
+
+              # Materialize symlink into real files/directories for a standalone distributable archive
+              if [ -d "$resolved_target" ]; then
+                echo "Materializing directory symlink: $link"
+                rm -f "$link"
+                cp -rL "$resolved_target" "$link"
+              elif [ -f "$resolved_target" ]; then
+                echo "Materializing file symlink: $link"
+                rm -f "$link"
+                cp -L "$resolved_target" "$link"
+              fi
+            fi
+          done
+
+          echo "Uncompressed directory size:"
+          du -sh "$TARGET_DIR"
+          echo "::endgroup::"
+
+      - name: Analyze Runner Resources and Compress with Max 7-Zip Settings
+        id: compress
+        run: |
+          echo "::group::Analyzing RAM and calculating LZMA2 dictionary parameters"
+          
+          # Read available memory and CPU core count
+          MEM_AVAIL_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+          MEM_AVAIL_MB=$((MEM_AVAIL_KB / 1024))
+          CPUS=$(nproc)
+
+          echo "Detected Available RAM: ${MEM_AVAIL_MB} MB"
+          echo "Detected CPU Cores: ${CPUS}"
+
+          # Reserve 1500 MB for OS and GitHub Actions background processes
+          RESERVED_MB=1500
+          if [ "$MEM_AVAIL_MB" -gt "$RESERVED_MB" ]; then
+            USABLE_MB=$((MEM_AVAIL_MB - RESERVED_MB))
+          else
+            USABLE_MB=1024
+          fi
+
+          echo "Usable RAM budget for LZMA2: ${USABLE_MB} MB"
+
+          # Evaluate dictionary sizes (MB) against LZMA2 memory requirements (~11.5x dict per thread)
+          DICT_CANDIDATES=(1536 1024 768 512 384 256 192 128 64 32)
+          CHOSEN_DICT=64
+          CHOSEN_THREADS=1
+
+          for d in "${DICT_CANDIDATES[@]}"; do
+            req_2t=$(( (d * 23) + 128 ))
+            req_1t=$(( (d * 23 / 2) + 64 ))
+
+            if [ "$CPUS" -ge 2 ] && [ "$req_2t" -le "$USABLE_MB" ]; then
+              CHOSEN_DICT=$d
+              CHOSEN_THREADS=2
+              break
+            elif [ "$req_1t" -le "$USABLE_MB" ]; then
+              CHOSEN_DICT=$d
+              CHOSEN_THREADS=1
+              break
+            fi
+          done
+
+          echo "Selected Dictionary Size: ${CHOSEN_DICT} MB (-md=${CHOSEN_DICT}m)"
+          echo "Selected Thread Count: ${CHOSEN_THREADS} (-mmt=${CHOSEN_THREADS})"
+          echo "::endgroup::"
+
+          echo "::group::Executing 7-Zip Ultra Compression"
+          TAG_NAME="${{ steps.clone.outputs.tag_name }}"
+          ARCHIVE_BASENAME="MeloNX-${TAG_NAME}"
+          ARCHIVE_FILE="${ARCHIVE_BASENAME}.7z"
+
+          # 7-Zip Ultra Compression Parameters
+          7zz a -t7z \
+            -mx=9 \
+            -mfb=273 \
+            -md="${CHOSEN_DICT}m" \
+            -ms=on \
+            -mqs=on \
+            -mmt="${CHOSEN_THREADS}" \
+            "$ARCHIVE_FILE" \
+            MeloNX
+
+          echo "archive_file=${ARCHIVE_FILE}" >> "$GITHUB_OUTPUT"
+          echo "archive_basename=${ARCHIVE_BASENAME}" >> "$GITHUB_OUTPUT"
+          echo "dict_size=${CHOSEN_DICT}m" >> "$GITHUB_OUTPUT"
+          echo "threads=${CHOSEN_THREADS}" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+      - name: Clean Source Files and Split Archive for Release
+        id: finalize
+        run: |
+          echo "::group::Reclaiming Runner Disk Space"
+          # Delete cloned tree immediately to free workspace storage
+          rm -rf MeloNX
+          rm -rf ../Ryubing ../LibHac 2>/dev/null || true
+          
+          echo "Disk space status after source removal:"
+          df -h "$PWD"
+          echo "::endgroup::"
+
+          echo "::group::Checking Archive Size & Chopping if Necessary"
+          ARCHIVE_FILE="${{ steps.compress.outputs.archive_file }}"
+          ARCHIVE_BASENAME="${{ steps.compress.outputs.archive_basename }}"
+          SPLIT_SIZE_MB="${{ github.event.inputs.split_size_mb || '2000' }}"
+          SPLIT_SIZE_BYTES=$(( SPLIT_SIZE_MB * 1024 * 1024 ))
+
+          ARCHIVE_SIZE_BYTES=$(stat -c%s "$ARCHIVE_FILE")
+          echo "Compressed Archive Size: $ARCHIVE_SIZE_BYTES bytes ($(( ARCHIVE_SIZE_BYTES / 1024 / 1024 )) MB)"
+
+          mkdir -p release_assets
+
+          if [ "$ARCHIVE_SIZE_BYTES" -gt "$SPLIT_SIZE_BYTES" ]; then
+            echo "Archive exceeds ${SPLIT_SIZE_MB}MB limit. Splitting into parts..."
+            split -b "${SPLIT_SIZE_MB}M" -d --additional-suffix=.7z.part "$ARCHIVE_FILE" "release_assets/${ARCHIVE_BASENAME}_part_"
+            rm -f "$ARCHIVE_FILE"
+          else
+            echo "Archive is within release file limits. Keeping single archive."
+            mv "$ARCHIVE_FILE" release_assets/
+          fi
+
+          # Generate SHA256 checksums
+          cd release_assets
+          sha256sum * > SHA256SUMS.txt
+          echo "Generated Checksums:"
+          cat SHA256SUMS.txt
+          cd ..
+          echo "::endgroup::"
+
+      - name: Create or Update GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::group::Publishing GitHub Release"
+          TAG_NAME="${{ steps.clone.outputs.tag_name }}"
+          COMMIT_HASH="${{ steps.clone.outputs.commit_hash }}"
+          COMMIT_FULL_HASH="${{ steps.clone.outputs.commit_full_hash }}"
+          COMMIT_SUBJECT="${{ steps.clone.outputs.commit_subject }}"
+          COMMIT_AUTHOR="${{ steps.clone.outputs.commit_author }}"
+          DICT_SIZE="${{ steps.compress.outputs.dict_size }}"
+          THREADS="${{ steps.compress.outputs.threads }}"
+
+          RELEASE_TITLE="MeloNX Snapshot — ${TAG_NAME}"
+
+          cat << EOF > release_notes.md
+          ## MeloNX Standalone Source Snapshot
+
+          Automated high-compression snapshot of [MeloNX](https://git.ryujinx.app/projects/MeloNX).
+
+          ### Repository Metadata
+          - **Commit Date / Version**: \`${TAG_NAME}\`
+          - **Commit Hash**: [\`${COMMIT_HASH}\`](https://git.ryujinx.app/projects/MeloNX/commit/${COMMIT_FULL_HASH})
+          - **Commit Message**: \`${COMMIT_SUBJECT}\`
+          - **Author**: \`${COMMIT_AUTHOR}\`
+
+          ### Compression Parameters
+          - **Engine**: Official 7-Zip Standalone (\`7zz\`)
+          - **Format**: 7z (LZMA2 Ultra)
+          - **Settings**: \`-mx=9 -mfb=273 -md=${DICT_SIZE} -ms=on -mqs=on -mmt=${THREADS}\`
+          - **Branches & Submodules**: All remote branches, submodules, tags, and LFS payloads tracked & materialized
+
+          ### Reassembly Instructions (if split into parts)
+          \`\`\`bash
+          # Linux / macOS
+          cat MeloNX-${TAG_NAME}_part_*.7z.part > MeloNX-${TAG_NAME}.7z
+          7zz x MeloNX-${TAG_NAME}.7z
+
+          # Windows (Command Prompt)
+          copy /b MeloNX-${TAG_NAME}_part_*.7z.part MeloNX-${TAG_NAME}.7z
+          7z x MeloNX-${TAG_NAME}.7z
+          \`\`\`
+
+          ### SHA-256 Checksums
+          \`\`\`
+          $(cat release_assets/SHA256SUMS.txt)
+          \`\`\`
+          EOF
+
+          gh release create "$TAG_NAME" release_assets/* \
+            --title "$RELEASE_TITLE" \
+            --notes-file release_notes.md \
+            --clobber
+
+          echo "Release successfully published for tag $TAG_NAME"
+          echo "::endgroup::"
+
+      - name: Generate Action Run Summary
+        run: |
+          TAG_NAME="${{ steps.clone.outputs.tag_name }}"
+          COMMIT_HASH="${{ steps.clone.outputs.commit_hash }}"
+          DICT_SIZE="${{ steps.compress.outputs.dict_size }}"
+          THREADS="${{ steps.compress.outputs.threads }}"
+
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          ## MeloNX Archive Build Summary
+
+          | Property | Value |
+          | :--- | :--- |
+          | **Version / Tag** | \`${TAG_NAME}\` |
+          | **Upstream Commit** | \`${COMMIT_HASH}\` |
+          | **LZMA2 Dictionary** | \`${DICT_SIZE}\` |
+          | **Threads Used** | \`${THREADS}\` |
+
+          ### Generated Release Files & Checksums
+          \`\`\`
+          $(cat release_assets/SHA256SUMS.txt)
+          \`\`\`
+          EOF
