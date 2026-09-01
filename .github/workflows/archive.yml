@@ -27,6 +27,9 @@ jobs:
   archive-and-release:
     name: Track, Compress and Release
     runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Install System Prerequisites
@@ -45,14 +48,13 @@ jobs:
       - name: Check Upstream Changes Against Previous Release Manifest
         id: check_updates
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_URL: ${{ github.event.inputs.repo_url || 'https://git.ryujinx.app/projects/MeloNX.git' }}
           FORCE_BUILD: ${{ github.event.inputs.force_build || 'false' }}
         run: |
           echo "::group::Checking for upstream repository updates"
           
           mkdir -p /tmp/prev_manifest
-          # Attempt to download manifest.json from the latest release
+          # Download manifest.json from the latest release of the current repository
           gh release download --pattern "manifest.json" --dir /tmp/prev_manifest 2>/dev/null || true
 
           python3 - << 'PYEOF'
@@ -127,7 +129,6 @@ jobs:
           print(f"Previous release tag: {prev_tag}")
           print(f"Previous recorded commit SHA: {prev_head_sha}")
 
-          # Compare branch heads
           branches_match = True
           current_branches = {k: v for k, v in remote_refs.items() if k.startswith("refs/heads/")}
           for ref, sha in current_branches.items():
@@ -429,7 +430,6 @@ jobs:
           compressed_bytes = int(os.environ.get("COMPRESSED_BYTES", "0"))
           is_split = os.environ.get("IS_SPLIT", "false") == "true"
 
-          # Gather asset details and checksums
           assets = []
           if os.path.exists("release_assets/SHA256SUMS.txt"):
               with open("release_assets/SHA256SUMS.txt", "r") as f:
@@ -508,8 +508,6 @@ jobs:
 
       - name: Create or Update GitHub Release
         if: steps.check_updates.outputs.should_build == 'true'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "::group::Publishing GitHub Release"
           TAG_NAME="${{ steps.clone.outputs.tag_name }}"
@@ -568,7 +566,8 @@ jobs:
             echo "Creating new release '$TAG_NAME'..."
             gh release create "$TAG_NAME" release_assets/* \
               --title "$RELEASE_TITLE" \
-              --notes-file release_notes.md
+              --notes-file release_notes.md \
+              --target "${{ github.ref_name }}"
           fi
 
           echo "Release successfully published for tag $TAG_NAME"
