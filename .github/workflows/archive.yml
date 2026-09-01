@@ -75,8 +75,8 @@ jobs:
           WORK_DIR="${GITHUB_WORKSPACE:-$PWD}"
           TARGET_DIR="${WORK_DIR}/MeloNX"
 
-          # 1. Full clone with all submodules
-          git clone --recurse-submodules --shallow-submodules=no "$REPO_URL" "$TARGET_DIR"
+          # 1. Full clone with all submodules (deep history)
+          git clone --recurse-submodules --no-shallow-submodules "$REPO_URL" "$TARGET_DIR"
           cd "$TARGET_DIR"
 
           # 2. Fetch all branches, tags, and refs
