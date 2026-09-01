@@ -323,10 +323,17 @@ jobs:
           \`\`\`
           EOF
 
-          gh release create "$TAG_NAME" release_assets/* \
-            --title "$RELEASE_TITLE" \
-            --notes-file release_notes.md \
-            --clobber
+          # Check if the release already exists for this tag
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release '$TAG_NAME' already exists. Updating release notes and uploading assets with --clobber..."
+            gh release edit "$TAG_NAME" --title "$RELEASE_TITLE" --notes-file release_notes.md
+            gh release upload "$TAG_NAME" release_assets/* --clobber
+          else
+            echo "Creating new release '$TAG_NAME'..."
+            gh release create "$TAG_NAME" release_assets/* \
+              --title "$RELEASE_TITLE" \
+              --notes-file release_notes.md
+          fi
 
           echo "Release successfully published for tag $TAG_NAME"
           echo "::endgroup::"
