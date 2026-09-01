@@ -11,6 +11,11 @@ on:
         description: 'Max file chunk size in MB (GitHub Release limit is 2000 MB)'
         required: true
         default: '2000'
+      force_build:
+        description: 'Force build even if no upstream updates are detected'
+        type: boolean
+        required: false
+        default: false
   schedule:
     # Runs weekly on Sunday at midnight UTC (adjust as needed)
     - cron: '0 0 * * 0'
@@ -20,7 +25,7 @@ permissions:
 
 jobs:
   archive-and-release:
-    name: Clone, Compress and Release
+    name: Track, Compress and Release
     runs-on: ubuntu-latest
 
     steps:
@@ -34,17 +39,122 @@ jobs:
             xz-utils \
             git \
             git-lfs \
-            coreutils
+            coreutils \
+            python3
+
+      - name: Check Upstream Changes Against Previous Release Manifest
+        id: check_updates
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_URL: ${{ github.event.inputs.repo_url || 'https://git.ryujinx.app/projects/MeloNX.git' }}
+          FORCE_BUILD: ${{ github.event.inputs.force_build || 'false' }}
+        run: |
+          echo "::group::Checking for upstream repository updates"
+          
+          mkdir -p /tmp/prev_manifest
+          # Attempt to download manifest.json from the latest release
+          gh release download --pattern "manifest.json" --dir /tmp/prev_manifest 2>/dev/null || true
+
+          python3 - << 'PYEOF'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          repo_url = os.environ.get("REPO_URL", "https://git.ryujinx.app/projects/MeloNX.git")
+          force_build = os.environ.get("FORCE_BUILD", "false").lower() == "true"
+          github_output = os.environ.get("GITHUB_OUTPUT", "")
+
+          def set_output(key, value):
+              if github_output:
+                  with open(github_output, "a") as f:
+                      f.write(f"{key}={value}\n")
+              print(f"Output: {key}={value}")
+
+          if force_build:
+              print("Force build enabled by user input. Skipping update check.")
+              set_output("should_build", "true")
+              set_output("reason", "Manual force build requested")
+              sys.exit(0)
+
+          print(f"Querying remote refs from: {repo_url}")
+          try:
+              ls_remote_out = subprocess.check_output(["git", "ls-remote", repo_url], text=True, timeout=60)
+          except Exception as e:
+              print(f"Warning: git ls-remote failed ({e}). Defaulting to should_build=true.")
+              set_output("should_build", "true")
+              set_output("reason", f"Remote ref check failed: {e}")
+              sys.exit(0)
+
+          remote_refs = {}
+          head_sha = None
+          for line in ls_remote_out.strip().splitlines():
+              parts = line.split()
+              if len(parts) >= 2:
+                  sha, ref = parts[0], parts[1]
+                  remote_refs[ref] = sha
+                  if ref == "HEAD":
+                      head_sha = sha
+
+          if not head_sha:
+              print("Could not resolve remote HEAD SHA. Defaulting to should_build=true.")
+              set_output("should_build", "true")
+              set_output("reason", "Remote HEAD SHA unresolved")
+              sys.exit(0)
+
+          print(f"Current Upstream HEAD commit: {head_sha}")
+
+          prev_manifest_path = "/tmp/prev_manifest/manifest.json"
+          if not os.path.exists(prev_manifest_path):
+              print("No previous release manifest.json found. Proceeding with initial release build.")
+              set_output("should_build", "true")
+              set_output("reason", "No previous manifest found (initial build)")
+              sys.exit(0)
+
+          try:
+              with open(prev_manifest_path, "r") as f:
+                  prev = json.load(f)
+          except Exception as e:
+              print(f"Failed to parse previous manifest ({e}). Proceeding with build.")
+              set_output("should_build", "true")
+              set_output("reason", "Corrupted previous manifest")
+              sys.exit(0)
+
+          prev_head_sha = prev.get("upstream", {}).get("commit", {}).get("full_hash")
+          prev_tag = prev.get("release", {}).get("tag_name", "unknown")
+          prev_branches = prev.get("upstream", {}).get("branches", {})
+
+          print(f"Previous release tag: {prev_tag}")
+          print(f"Previous recorded commit SHA: {prev_head_sha}")
+
+          # Compare branch heads
+          branches_match = True
+          current_branches = {k: v for k, v in remote_refs.items() if k.startswith("refs/heads/")}
+          for ref, sha in current_branches.items():
+              if prev_branches.get(ref) != sha:
+                  branches_match = False
+                  print(f"Branch ref change detected: {ref} ({prev_branches.get(ref)} -> {sha})")
+                  break
+
+          if prev_head_sha == head_sha and branches_match:
+              print(f"Upstream repository has had no updates since release {prev_tag} ({head_sha[:7]}). Skipping build.")
+              set_output("should_build", "false")
+              set_output("reason", f"Upstream is unchanged since release {prev_tag} ({head_sha[:7]})")
+          else:
+              print(f"Upstream update detected ({prev_head_sha[:7] if prev_head_sha else 'none'} -> {head_sha[:7]}). Proceeding with build.")
+              set_output("should_build", "true")
+              set_output("reason", f"New upstream commit detected: {head_sha[:7]}")
+          PYEOF
+          echo "::endgroup::"
 
       - name: Fetch and Install Latest Official 7-Zip Binary
+        if: steps.check_updates.outputs.should_build == 'true'
         run: |
           echo "::group::Installing official 7-Zip release binary"
           
-          # Attempt resolving latest Linux x64 binary URL from official GitHub releases
           SEVENZIP_URL=$(curl -fsSL https://api.github.com/repos/ip7z/7zip/releases/latest 2>/dev/null \
             | jq -r '.assets[] | select(.name | test("linux-x64.tar.xz$")) | .browser_download_url' | head -n1 || true)
 
-          # Fallback to direct scraping from official 7-zip.org download page if GitHub API is throttled
           if [ -z "$SEVENZIP_URL" ] || [ "$SEVENZIP_URL" = "null" ]; then
             DOWNLOAD_HTML=$(curl -fsSL https://www.7-zip.org/download.html 2>/dev/null || true)
             TAR_REL_PATH=$(echo "$DOWNLOAD_HTML" | grep -Eo 'a/7z[0-9]+-linux-x64\.tar\.xz' | head -n1 || true)
@@ -68,6 +178,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Clone Full Repository and External Symlinked Dependencies
+        if: steps.check_updates.outputs.should_build == 'true'
         id: clone
         run: |
           echo "::group::Cloning MeloNX repository with all branches, tags, and LFS objects"
@@ -115,12 +226,14 @@ jobs:
           COMMIT_FULL_HASH=$(git log -1 --format=%H)
           COMMIT_SUBJECT=$(git log -1 --format=%s)
           COMMIT_AUTHOR=$(git log -1 --format='%an <%ae>')
+          COMMIT_DATE_ISO=$(git log -1 --format=%cI)
 
           echo "tag_name=${COMMIT_DATE}" >> "$GITHUB_OUTPUT"
           echo "commit_hash=${COMMIT_HASH}" >> "$GITHUB_OUTPUT"
           echo "commit_full_hash=${COMMIT_FULL_HASH}" >> "$GITHUB_OUTPUT"
           echo "commit_subject=${COMMIT_SUBJECT}" >> "$GITHUB_OUTPUT"
           echo "commit_author=${COMMIT_AUTHOR}" >> "$GITHUB_OUTPUT"
+          echo "commit_date_iso=${COMMIT_DATE_ISO}" >> "$GITHUB_OUTPUT"
 
           echo "Latest commit date: $COMMIT_DATE ($COMMIT_HASH)"
           echo "::endgroup::"
@@ -135,12 +248,10 @@ jobs:
             link_dir=$(dirname "$link")
             resolved_target=$(realpath -m "$link_dir/$raw_target")
 
-            # Check if symlink points outside the cloned repo
             if [[ "$resolved_target" != "$REPO_ROOT"* ]]; then
               echo "External symlink found: $link -> $raw_target"
               dep_name=$(basename "$resolved_target")
 
-              # If target is missing, attempt to clone sibling repo from git.ryujinx.app
               if [ ! -e "$resolved_target" ]; then
                 echo "Attempting to clone external dependency '$dep_name' into $PARENT_DIR/$dep_name..."
                 git clone --recurse-submodules "https://git.ryujinx.app/projects/${dep_name}.git" "$PARENT_DIR/$dep_name" 2>/dev/null || \
@@ -148,7 +259,6 @@ jobs:
                 true
               fi
 
-              # Materialize symlink into real files/directories for a standalone distributable archive
               if [ -d "$resolved_target" ]; then
                 echo "Materializing directory symlink: $link"
                 rm -f "$link"
@@ -161,16 +271,17 @@ jobs:
             fi
           done
 
-          echo "Uncompressed directory size:"
-          du -sh "$TARGET_DIR"
+          UNCOMPRESSED_BYTES=$(du -sb "$TARGET_DIR" | cut -f1)
+          echo "uncompressed_bytes=${UNCOMPRESSED_BYTES}" >> "$GITHUB_OUTPUT"
+          echo "Uncompressed directory size: $(du -sh "$TARGET_DIR" | cut -f1)"
           echo "::endgroup::"
 
       - name: Analyze Runner Resources and Compress with Max 7-Zip Settings
+        if: steps.check_updates.outputs.should_build == 'true'
         id: compress
         run: |
           echo "::group::Analyzing RAM and calculating LZMA2 dictionary parameters"
           
-          # Read available memory and CPU core count
           MEM_AVAIL_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
           MEM_AVAIL_MB=$((MEM_AVAIL_KB / 1024))
           CPUS=$(nproc)
@@ -178,7 +289,6 @@ jobs:
           echo "Detected Available RAM: ${MEM_AVAIL_MB} MB"
           echo "Detected CPU Cores: ${CPUS}"
 
-          # Reserve 1500 MB for OS and GitHub Actions background processes
           RESERVED_MB=1500
           if [ "$MEM_AVAIL_MB" -gt "$RESERVED_MB" ]; then
             USABLE_MB=$((MEM_AVAIL_MB - RESERVED_MB))
@@ -188,7 +298,6 @@ jobs:
 
           echo "Usable RAM budget for LZMA2: ${USABLE_MB} MB"
 
-          # Evaluate dictionary sizes (MB) against LZMA2 memory requirements (~11.5x dict per thread)
           DICT_CANDIDATES=(1536 1024 768 512 384 256 192 128 64 32)
           CHOSEN_DICT=64
           CHOSEN_THREADS=1
@@ -217,7 +326,6 @@ jobs:
           ARCHIVE_BASENAME="MeloNX-${TAG_NAME}"
           ARCHIVE_FILE="${ARCHIVE_BASENAME}.7z"
 
-          # 7-Zip Ultra Compression Parameters
           7zz a -t7z \
             -mx=9 \
             -mfb=273 \
@@ -230,15 +338,17 @@ jobs:
 
           echo "archive_file=${ARCHIVE_FILE}" >> "$GITHUB_OUTPUT"
           echo "archive_basename=${ARCHIVE_BASENAME}" >> "$GITHUB_OUTPUT"
-          echo "dict_size=${CHOSEN_DICT}m" >> "$GITHUB_OUTPUT"
+          echo "dict_size=${CHOSEN_DICT}" >> "$GITHUB_OUTPUT"
           echo "threads=${CHOSEN_THREADS}" >> "$GITHUB_OUTPUT"
+          echo "avail_ram_mb=${MEM_AVAIL_MB}" >> "$GITHUB_OUTPUT"
+          echo "cpu_cores=${CPUS}" >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
 
       - name: Clean Source Files and Split Archive for Release
+        if: steps.check_updates.outputs.should_build == 'true'
         id: finalize
         run: |
           echo "::group::Reclaiming Runner Disk Space"
-          # Delete cloned tree immediately to free workspace storage
           rm -rf MeloNX
           rm -rf ../Ryubing ../LibHac 2>/dev/null || true
           
@@ -257,24 +367,147 @@ jobs:
 
           mkdir -p release_assets
 
+          IS_SPLIT="false"
           if [ "$ARCHIVE_SIZE_BYTES" -gt "$SPLIT_SIZE_BYTES" ]; then
             echo "Archive exceeds ${SPLIT_SIZE_MB}MB limit. Splitting into parts..."
             split -b "${SPLIT_SIZE_MB}M" -d --additional-suffix=.7z.part "$ARCHIVE_FILE" "release_assets/${ARCHIVE_BASENAME}_part_"
             rm -f "$ARCHIVE_FILE"
+            IS_SPLIT="true"
           else
             echo "Archive is within release file limits. Keeping single archive."
             mv "$ARCHIVE_FILE" release_assets/
           fi
 
-          # Generate SHA256 checksums
           cd release_assets
-          sha256sum * > SHA256SUMS.txt
+          sha256sum MeloNX* > SHA256SUMS.txt
           echo "Generated Checksums:"
           cat SHA256SUMS.txt
           cd ..
+
+          echo "compressed_bytes=${ARCHIVE_SIZE_BYTES}" >> "$GITHUB_OUTPUT"
+          echo "is_split=${IS_SPLIT}" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+      - name: Build Rich JSON Metadata Tracking Manifest
+        if: steps.check_updates.outputs.should_build == 'true'
+        id: manifest
+        env:
+          TAG_NAME: ${{ steps.clone.outputs.tag_name }}
+          COMMIT_HASH: ${{ steps.clone.outputs.commit_hash }}
+          COMMIT_FULL_HASH: ${{ steps.clone.outputs.commit_full_hash }}
+          COMMIT_SUBJECT: ${{ steps.clone.outputs.commit_subject }}
+          COMMIT_AUTHOR: ${{ steps.clone.outputs.commit_author }}
+          COMMIT_DATE_ISO: ${{ steps.clone.outputs.commit_date_iso }}
+          REPO_URL: ${{ github.event.inputs.repo_url || 'https://git.ryujinx.app/projects/MeloNX.git' }}
+          DICT_SIZE: ${{ steps.compress.outputs.dict_size }}
+          THREADS: ${{ steps.compress.outputs.threads }}
+          AVAIL_RAM: ${{ steps.compress.outputs.avail_ram_mb }}
+          CPU_CORES: ${{ steps.compress.outputs.cpu_cores }}
+          UNCOMPRESSED_BYTES: ${{ steps.clone.outputs.uncompressed_bytes || '0' }}
+          COMPRESSED_BYTES: ${{ steps.finalize.outputs.compressed_bytes || '0' }}
+          IS_SPLIT: ${{ steps.finalize.outputs.is_split }}
+        run: |
+          echo "::group::Generating manifest.json tracking state"
+          
+          python3 - << 'PYEOF'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          tag_name = os.environ.get("TAG_NAME", "")
+          commit_hash = os.environ.get("COMMIT_HASH", "")
+          commit_full_hash = os.environ.get("COMMIT_FULL_HASH", "")
+          commit_subject = os.environ.get("COMMIT_SUBJECT", "")
+          commit_author = os.environ.get("COMMIT_AUTHOR", "")
+          commit_date_iso = os.environ.get("COMMIT_DATE_ISO", "")
+          repo_url = os.environ.get("REPO_URL", "")
+          dict_size = int(os.environ.get("DICT_SIZE", "64"))
+          threads = int(os.environ.get("THREADS", "1"))
+          avail_ram = int(os.environ.get("AVAIL_RAM", "0"))
+          cpu_cores = int(os.environ.get("CPU_CORES", "1"))
+          uncompressed_bytes = int(os.environ.get("UNCOMPRESSED_BYTES", "0"))
+          compressed_bytes = int(os.environ.get("COMPRESSED_BYTES", "0"))
+          is_split = os.environ.get("IS_SPLIT", "false") == "true"
+
+          # Gather asset details and checksums
+          assets = []
+          if os.path.exists("release_assets/SHA256SUMS.txt"):
+              with open("release_assets/SHA256SUMS.txt", "r") as f:
+                  for line in f:
+                      parts = line.strip().split(maxsplit=1)
+                      if len(parts) == 2:
+                          csum, fname = parts[0], parts[1]
+                          fpath = os.path.join("release_assets", fname)
+                          fsize = os.path.getsize(fpath) if os.path.exists(fpath) else 0
+                          assets.append({
+                              "filename": fname,
+                              "size_bytes": fsize,
+                              "sha256": csum
+                          })
+
+          ratio = round((compressed_bytes / uncompressed_bytes * 100), 2) if uncompressed_bytes > 0 else 0.0
+
+          manifest = {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "schema_version": "1.1.0",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "workflow": {
+                  "run_id": os.environ.get("GITHUB_RUN_ID"),
+                  "run_number": os.environ.get("GITHUB_RUN_NUMBER"),
+                  "repository": os.environ.get("GITHUB_REPOSITORY"),
+                  "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF")
+              },
+              "release": {
+                  "tag_name": tag_name,
+                  "title": f"MeloNX Snapshot — {tag_name}",
+                  "target_commit": commit_full_hash
+              },
+              "upstream": {
+                  "repository_url": repo_url,
+                  "commit": {
+                      "full_hash": commit_full_hash,
+                      "short_hash": commit_hash,
+                      "date_iso": commit_date_iso,
+                      "date_tag": tag_name,
+                      "subject": commit_subject,
+                      "author": commit_author
+                  }
+              },
+              "build_environment": {
+                  "runner_os": os.environ.get("RUNNER_OS", "Linux"),
+                  "runner_arch": os.environ.get("RUNNER_ARCH", "X64"),
+                  "cpu_cores": cpu_cores,
+                  "available_ram_mb": avail_ram,
+                  "compression_engine": "7-Zip Standalone (7zz)",
+                  "lzma2_parameters": {
+                      "compression_level": 9,
+                      "fast_bytes": 273,
+                      "dictionary_size_mb": dict_size,
+                      "threads": threads,
+                      "solid_block": True,
+                      "sort_by_type": True
+                  }
+              },
+              "archive_metrics": {
+                  "uncompressed_bytes": uncompressed_bytes,
+                  "compressed_bytes": compressed_bytes,
+                  "compression_ratio_percent": ratio,
+                  "is_split": is_split,
+                  "part_count": len(assets),
+                  "assets": assets
+              }
+          }
+
+          with open("release_assets/manifest.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+
+          print("Generated release_assets/manifest.json:")
+          print(json.dumps(manifest, indent=2))
+          PYEOF
           echo "::endgroup::"
 
       - name: Create or Update GitHub Release
+        if: steps.check_updates.outputs.should_build == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -303,8 +536,11 @@ jobs:
           ### Compression Parameters
           - **Engine**: Official 7-Zip Standalone (\`7zz\`)
           - **Format**: 7z (LZMA2 Ultra)
-          - **Settings**: \`-mx=9 -mfb=273 -md=${DICT_SIZE} -ms=on -mqs=on -mmt=${THREADS}\`
+          - **Settings**: \`-mx=9 -mfb=273 -md=${DICT_SIZE}m -ms=on -mqs=on -mmt=${THREADS}\`
           - **Branches & Submodules**: All remote branches, submodules, tags, and LFS payloads tracked & materialized
+
+          ### Tracking Manifest
+          A structured \`manifest.json\` is attached containing full build metrics, upstream commit SHAs, and compression telemetry.
 
           ### Reassembly Instructions (if split into parts)
           \`\`\`bash
@@ -339,24 +575,40 @@ jobs:
           echo "::endgroup::"
 
       - name: Generate Action Run Summary
+        if: always()
         run: |
-          TAG_NAME="${{ steps.clone.outputs.tag_name }}"
-          COMMIT_HASH="${{ steps.clone.outputs.commit_hash }}"
-          DICT_SIZE="${{ steps.compress.outputs.dict_size }}"
-          THREADS="${{ steps.compress.outputs.threads }}"
+          SHOULD_BUILD="${{ steps.check_updates.outputs.should_build }}"
+          REASON="${{ steps.check_updates.outputs.reason }}"
 
-          cat << EOF >> $GITHUB_STEP_SUMMARY
-          ## MeloNX Archive Build Summary
+          if [ "$SHOULD_BUILD" != "true" ]; then
+            cat << EOF >> $GITHUB_STEP_SUMMARY
+          ## MeloNX Archive Run Summary — Skipped
+
+          > **Status:** Skipped (No Upstream Changes)  
+          > **Reason:** ${REASON}
+
+          No new commits or branch updates were detected in the upstream repository since the last release.
+          To force a rebuild, trigger the workflow manually with the \`force_build: true\` parameter.
+          EOF
+          else
+            TAG_NAME="${{ steps.clone.outputs.tag_name }}"
+            COMMIT_HASH="${{ steps.clone.outputs.commit_hash }}"
+            DICT_SIZE="${{ steps.compress.outputs.dict_size }}"
+            THREADS="${{ steps.compress.outputs.threads }}"
+
+            cat << EOF >> $GITHUB_STEP_SUMMARY
+          ## MeloNX Archive Build Summary — Completed
 
           | Property | Value |
           | :--- | :--- |
           | **Version / Tag** | \`${TAG_NAME}\` |
           | **Upstream Commit** | \`${COMMIT_HASH}\` |
-          | **LZMA2 Dictionary** | \`${DICT_SIZE}\` |
+          | **LZMA2 Dictionary** | \`${DICT_SIZE} MB\` |
           | **Threads Used** | \`${THREADS}\` |
 
-          ### Generated Release Files & Checksums
+          ### Generated Release Assets & Checksums
           \`\`\`
-          $(cat release_assets/SHA256SUMS.txt)
+          $(cat release_assets/SHA256SUMS.txt 2>/dev/null || echo "No checksums available")
           \`\`\`
           EOF
+          fi
