@@ -6,7 +6,7 @@ on:
       repo_url:
         description: 'Target Repository URL'
         required: true
-        default: 'https://git.ryujinx.app/projects/MeloNX.git'
+        default: 'https://starforgejo.dev/projects/MeloNX.git'
       split_size_mb:
         description: 'Max file chunk size in MB (GitHub Release limit is 2000 MB)'
         required: true
@@ -48,7 +48,7 @@ jobs:
       - name: Check Upstream Changes Against Previous Release Manifest
         id: check_updates
         env:
-          REPO_URL: ${{ github.event.inputs.repo_url || 'https://git.ryujinx.app/projects/MeloNX.git' }}
+          REPO_URL: ${{ github.event.inputs.repo_url || 'https://starforgejo.dev/projects/MeloNX.git' }}
           FORCE_BUILD: ${{ github.event.inputs.force_build || 'false' }}
         run: |
           echo "::group::Checking for upstream repository updates"
@@ -63,7 +63,7 @@ jobs:
           import subprocess
           import sys
 
-          repo_url = os.environ.get("REPO_URL", "https://git.ryujinx.app/projects/MeloNX.git")
+          repo_url = os.environ.get("REPO_URL", "https://starforgejo.dev/projects/MeloNX.git")
           force_build = os.environ.get("FORCE_BUILD", "false").lower() == "true"
           github_output = os.environ.get("GITHUB_OUTPUT", "")
 
@@ -183,7 +183,7 @@ jobs:
         id: clone
         run: |
           echo "::group::Cloning MeloNX repository with all branches, tags, and LFS objects"
-          REPO_URL="${{ github.event.inputs.repo_url || 'https://git.ryujinx.app/projects/MeloNX.git' }}"
+          REPO_URL="${{ github.event.inputs.repo_url || 'https://starforgejo.dev/projects/MeloNX.git' }}"
           WORK_DIR="${GITHUB_WORKSPACE:-$PWD}"
           TARGET_DIR="${WORK_DIR}/MeloNX"
 
@@ -399,7 +399,7 @@ jobs:
           COMMIT_SUBJECT: ${{ steps.clone.outputs.commit_subject }}
           COMMIT_AUTHOR: ${{ steps.clone.outputs.commit_author }}
           COMMIT_DATE_ISO: ${{ steps.clone.outputs.commit_date_iso }}
-          REPO_URL: ${{ github.event.inputs.repo_url || 'https://git.ryujinx.app/projects/MeloNX.git' }}
+          REPO_URL: ${{ github.event.inputs.repo_url || 'https://starforgejo.dev/projects/MeloNX.git' }}
           DICT_SIZE: ${{ steps.compress.outputs.dict_size }}
           THREADS: ${{ steps.compress.outputs.threads }}
           AVAIL_RAM: ${{ steps.compress.outputs.avail_ram_mb }}
@@ -523,11 +523,11 @@ jobs:
           cat << EOF > release_notes.md
           ## MeloNX Standalone Source Snapshot
 
-          Automated high-compression snapshot of [MeloNX](https://git.ryujinx.app/projects/MeloNX).
+          Automated high-compression snapshot of [MeloNX](https://starforgejo.dev/projects/MeloNX).
 
           ### Repository Metadata
           - **Commit Date / Version**: \`${TAG_NAME}\`
-          - **Commit Hash**: [\`${COMMIT_HASH}\`](https://git.ryujinx.app/projects/MeloNX/commit/${COMMIT_FULL_HASH})
+          - **Commit Hash**: [\`${COMMIT_HASH}\`](https://starforgejo.dev/projects/MeloNX/commit/${COMMIT_FULL_HASH})
           - **Commit Message**: \`${COMMIT_SUBJECT}\`
           - **Author**: \`${COMMIT_AUTHOR}\`
 
